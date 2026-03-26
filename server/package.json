@@ -4,8 +4,18 @@
   "description": "MCP bridge server connecting Claude to browser extension via WebSocket",
   "type": "module",
   "main": "index.mjs",
+  "bin": {
+    "claude-web-bridge": "index.mjs"
+  },
   "scripts": {
     "start": "node index.mjs"
+  },
+  "keywords": ["mcp", "claude", "browser", "bridge", "extension", "web"],
+  "author": "gokul2507",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gokul2507/Claude-Web-Bridge.git"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
