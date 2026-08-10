@@ -5,7 +5,7 @@ import { z } from "zod";
 
 // Coercive number type - MCP clients often send numbers as strings
 const zNum = z.preprocess((v) => (typeof v === "string" ? Number(v) : v), z.number());
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 
 // ── State ──────────────────────────────────────────────────────────────────
 let extensionSocket = null;
@@ -42,34 +42,60 @@ if (process.env.CWB_TAKEOVER === "1") {
   } catch {}
 }
 
-// ── WebSocket Server (extension connects here) ────────────────────────────
-const wss = new WebSocketServer({ port: WS_PORT });
+// ── Hub / peer role ───────────────────────────────────────────────────────
+// Every Claude session starts its own bridge server, but the extension holds a
+// single WebSocket to a single port, so only one process can own the browser.
+// Rather than let sessions fight for it, the first server to bind becomes the
+// HUB and owns the extension; every later server becomes a PEER and forwards its
+// tool calls through the hub. Several sessions can then drive one browser.
+//
+// Peers are told apart from the extension by connection path, so the extension
+// needs no changes — it still connects to "/".
+const PEER_PATH = "/peer";
+const EXT_NOT_CONNECTED =
+  "Browser extension is not connected. Please open the extension and click Connect.";
 
-wss.on("error", (err) => {
-  if (err.code === "EADDRINUSE") {
-    // Another live server owns the port and therefore owns the extension. We
-    // cannot serve the browser, and staying alive would leave a deaf server
-    // whose every tool reports "extension is not connected" — a symptom that
-    // sends users to the browser, where nothing is wrong. Exit instead, so the
-    // client reports a failed server.
-    console.error(
-      `[claude-web-bridge] Port ${WS_PORT} is already held by another claude-web-bridge ` +
-      `server, which owns the browser extension. This instance is exiting.\n` +
-      `  The bridge currently supports one Claude session at a time. Use the browser ` +
-      `tools from the session that started first.\n` +
-      `  If that server is orphaned or wedged, reclaim the port with ` +
-      `CWB_TAKEOVER=1 in this server's env, or find it with: lsof -ti :${WS_PORT} -sTCP:LISTEN`
-    );
-    process.exit(1);
-  }
-  console.error("[claude-web-bridge] WebSocket server error:", err.message);
-});
+let role = null;             // "hub" | "peer" | null while negotiating
+let wss = null;              // hub: the WebSocket server
+let hubSocket = null;        // peer: our client connection to the hub
+const peerSockets = new Set();  // hub: connected peer servers
+const hubRelays = new Map();    // hub: our request id -> peer awaiting the reply
 
-wss.on("listening", () => {
-  console.error(`[claude-web-bridge] WebSocket server listening on ws://localhost:${WS_PORT}`);
-});
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-wss.on("connection", (ws) => {
+// ── Hub side ──────────────────────────────────────────────────────────────
+function tryBecomeHub() {
+  return new Promise((resolve) => {
+    // No host given, so this binds the same interfaces as before. The extension
+    // reaches the port over IPv6 loopback, so do not narrow this to 127.0.0.1.
+    const server = new WebSocketServer({ port: WS_PORT });
+    const onError = (err) => {
+      server.off("listening", onListening);
+      if (err.code !== "EADDRINUSE") {
+        console.error("[claude-web-bridge] WebSocket server error:", err.message);
+      }
+      try { server.close(); } catch {}
+      resolve(false);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      server.on("error", (e) => console.error("[claude-web-bridge] Hub error:", e.message));
+      wss = server;
+      resolve(true);
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+  });
+}
+
+function setupHub() {
+  wss.on("connection", (ws, req) => {
+    if ((req?.url || "/") === PEER_PATH) attachPeer(ws);
+    else attachExtension(ws);
+  });
+}
+
+function attachExtension(ws) {
   console.error("[claude-web-bridge] Extension connected");
   extensionSocket = ws;
   ws.lastSeenAt = Date.now();
@@ -82,14 +108,23 @@ wss.on("connection", (ws) => {
       const msg = JSON.parse(raw.toString());
       // Ignore keepalive pings from the extension
       if (msg.type === "ping") return;
+
+      // A reply to a request we relayed on some peer's behalf goes back to it.
+      const relay = hubRelays.get(msg.id);
+      if (relay) {
+        clearTimeout(relay.timeout);
+        hubRelays.delete(msg.id);
+        sendJson(relay.peerWs, {
+          type: "response", id: relay.peerRequestId, result: msg.result, error: msg.error,
+        });
+        return;
+      }
+
       const pending = pendingRequests.get(msg.id);
       if (pending) {
         pendingRequests.delete(msg.id);
-        if (msg.error) {
-          pending.reject(new Error(msg.error));
-        } else {
-          pending.resolve(msg.result);
-        }
+        if (msg.error) pending.reject(new Error(msg.error));
+        else pending.resolve(msg.result);
       }
     } catch (e) {
       console.error("[claude-web-bridge] Bad message from extension:", e.message);
@@ -107,8 +142,188 @@ wss.on("connection", (ws) => {
       pending.reject(new Error("Extension disconnected"));
       pendingRequests.delete(id);
     }
+    for (const [id, relay] of hubRelays) {
+      clearTimeout(relay.timeout);
+      hubRelays.delete(id);
+      sendJson(relay.peerWs, { type: "response", id: relay.peerRequestId, error: "Extension disconnected" });
+    }
   });
-});
+}
+
+function attachPeer(ws) {
+  peerSockets.add(ws);
+  console.error(`[claude-web-bridge] Peer session connected (${peerSockets.size} peer(s))`);
+
+  ws.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+    if (msg.type === "status") {
+      sendJson(ws, {
+        type: "response", id: msg.id,
+        result: { connected: isExtensionLive(), role: "hub", peers: peerSockets.size },
+      });
+      return;
+    }
+    if (msg.type === "request") relayPeerRequest(ws, msg);
+  });
+
+  ws.on("close", () => {
+    peerSockets.delete(ws);
+    // Drop relays belonging to this peer; nobody is waiting for them now.
+    for (const [id, relay] of hubRelays) {
+      if (relay.peerWs === ws) { clearTimeout(relay.timeout); hubRelays.delete(id); }
+    }
+    console.error(`[claude-web-bridge] Peer session disconnected (${peerSockets.size} peer(s))`);
+  });
+}
+
+function relayPeerRequest(peerWs, msg) {
+  if (!isExtensionLive()) {
+    sendJson(peerWs, { type: "response", id: msg.id, error: EXT_NOT_CONNECTED });
+    return;
+  }
+  const timeoutMs = msg.timeoutMs || 30000;
+  const id = ++requestId;
+  // Give the peer's own timer the first chance to fire, so the caller sees its
+  // own timeout rather than a racing one from here.
+  const timeout = setTimeout(() => {
+    hubRelays.delete(id);
+    sendJson(peerWs, { type: "response", id: msg.id, error: `Request timed out after ${timeoutMs}ms` });
+  }, timeoutMs + 2000);
+  hubRelays.set(id, { peerWs, peerRequestId: msg.id, timeout });
+  sendJson(extensionSocket, { id, action: msg.action, params: msg.params });
+}
+
+// ── Peer side ─────────────────────────────────────────────────────────────
+function connectToHub() {
+  return new Promise((resolve) => {
+    let ws;
+    try { ws = new WebSocket(`ws://localhost:${WS_PORT}${PEER_PATH}`); }
+    catch { resolve(false); return; }
+
+    const fail = () => { try { ws.terminate(); } catch {} resolve(false); };
+    ws.once("error", fail);
+    ws.once("open", () => {
+      ws.off("error", fail);
+      ws.on("error", (e) => console.error("[claude-web-bridge] Hub link error:", e.message));
+      hubSocket = ws;
+      setupPeer(ws);
+      resolve(true);
+    });
+  });
+}
+
+function setupPeer(ws) {
+  ws.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (msg.type !== "response") return;
+    const pending = pendingRequests.get(msg.id);
+    if (!pending) return;
+    pendingRequests.delete(msg.id);
+    if (msg.error) pending.reject(new Error(msg.error));
+    else pending.resolve(msg.result);
+  });
+
+  ws.on("close", () => {
+    if (hubSocket !== ws) return;
+    hubSocket = null;
+    role = null;
+    for (const [id, pending] of pendingRequests) {
+      pending.reject(new Error("Bridge hub disconnected"));
+      pendingRequests.delete(id);
+    }
+    console.error("[claude-web-bridge] Hub went away — renegotiating role");
+    negotiateRole();
+  });
+}
+
+function sendViaHub(action, params, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    if (!hubSocket || hubSocket.readyState !== 1) {
+      reject(new Error("Not connected to the bridge hub yet. Retry in a moment."));
+      return;
+    }
+    const id = ++requestId;
+    const timeout = setTimeout(() => {
+      pendingRequests.delete(id);
+      reject(new Error(`Request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    pendingRequests.set(id, {
+      resolve: (v) => { clearTimeout(timeout); resolve(v); },
+      reject: (e) => { clearTimeout(timeout); reject(e); },
+    });
+    sendJson(hubSocket, { type: "request", id, action, params, timeoutMs });
+  });
+}
+
+function requestHubStatus() {
+  return new Promise((resolve, reject) => {
+    if (!hubSocket || hubSocket.readyState !== 1) {
+      reject(new Error("Not connected to the bridge hub"));
+      return;
+    }
+    const id = ++requestId;
+    const timeout = setTimeout(() => {
+      pendingRequests.delete(id);
+      reject(new Error("Hub status request timed out"));
+    }, 5000);
+    pendingRequests.set(id, {
+      resolve: (v) => { clearTimeout(timeout); resolve(v); },
+      reject: (e) => { clearTimeout(timeout); reject(e); },
+    });
+    sendJson(hubSocket, { type: "status", id });
+  });
+}
+
+// ── Role negotiation ──────────────────────────────────────────────────────
+function isExtensionLive() {
+  return !!extensionSocket && extensionSocket.readyState === 1;
+}
+
+function sendJson(ws, payload) {
+  try { ws.send(JSON.stringify(payload)); } catch {}
+}
+
+let negotiating = false;
+
+async function negotiateRole() {
+  if (negotiating) return;
+  negotiating = true;
+  try {
+    for (let attempt = 0; ; attempt++) {
+      if (await tryBecomeHub()) {
+        role = "hub";
+        setupHub();
+        console.error(`[claude-web-bridge] Hub: listening on ws://localhost:${WS_PORT}`);
+        return;
+      }
+      // Someone else holds the port. Jitter first so several peers starting at
+      // once do not stampede the hub with simultaneous connects.
+      await sleep(50 + Math.floor(Math.random() * 250));
+      if (await connectToHub()) {
+        role = "peer";
+        console.error(
+          `[claude-web-bridge] Peer: another session owns the browser; ` +
+          `forwarding tool calls through it.`
+        );
+        return;
+      }
+      // Neither worked — the hub may be mid-restart. Back off and retry.
+      const backoff = Math.min(5000, 250 * 2 ** attempt);
+      if (attempt === 3) {
+        console.error(
+          `[claude-web-bridge] Could not bind port ${WS_PORT} or reach a hub on it. ` +
+          `Retrying in the background; browser tools will error until this resolves.`
+        );
+      }
+      await sleep(backoff);
+    }
+  } finally {
+    negotiating = false;
+  }
+}
 
 // ── Heartbeat: detect a socket the extension has silently abandoned ───────
 // Chrome suspends MV3 service workers, which can leave a half-open socket that
@@ -120,6 +335,7 @@ const HEARTBEAT_INTERVAL_MS = 20000;
 const HEARTBEAT_TIMEOUT_MS = 60000;
 
 setInterval(() => {
+  if (role !== "hub") return;  // only the hub holds the extension socket
   const ws = extensionSocket;
   if (!ws) return;
   if (Date.now() - (ws.lastSeenAt || 0) > HEARTBEAT_TIMEOUT_MS) {
@@ -134,11 +350,20 @@ setInterval(() => {
   try { ws.ping(); } catch {}
 }, HEARTBEAT_INTERVAL_MS).unref();
 
+await negotiateRole();
+
 // ── Helper: send command to extension and await response ──────────────────
 function sendToExtensionOnce(action, params = {}, timeoutMs = 30000) {
+  // A peer does not hold the extension socket — the hub does. Forward instead.
+  if (role === "peer") return sendViaHub(action, params, timeoutMs);
+  if (role === null) {
+    return Promise.reject(new Error(
+      "Bridge is still deciding which session owns the browser. Retry in a moment."
+    ));
+  }
   return new Promise((resolve, reject) => {
-    if (!extensionSocket || extensionSocket.readyState !== 1) {
-      reject(new Error("Browser extension is not connected. Please open the extension and click Connect."));
+    if (!isExtensionLive()) {
+      reject(new Error(EXT_NOT_CONNECTED));
       return;
     }
     const id = ++requestId;
@@ -203,16 +428,32 @@ const server = new McpServer({
 // Tool: connection status
 server.tool(
   "bridge_status",
-  "Check if the browser extension is connected",
+  "Check if the browser extension is connected. Also reports this server's role: " +
+  "'hub' means it owns the extension connection directly, 'peer' means another " +
+  "Claude session owns it and this server forwards tool calls through that one. " +
+  "Either way the browser tools work; the role is diagnostic.",
   {},
   async () => {
-    const connected = extensionSocket && extensionSocket.readyState === 1;
-    return {
-      content: [{
-        type: "text",
-        text: JSON.stringify({ connected, ws_port: WS_PORT, pending_requests: pendingRequests.size }, null, 2),
-      }],
-    };
+    const status = { ws_port: WS_PORT, role, pending_requests: pendingRequests.size };
+    if (role === "hub") {
+      status.connected = isExtensionLive();
+      status.peer_sessions = peerSockets.size;
+    } else if (role === "peer") {
+      status.hub_link = hubSocket && hubSocket.readyState === 1 ? "up" : "down";
+      // Extension connectivity is the hub's to report, so ask it.
+      try {
+        const hub = await requestHubStatus();
+        status.connected = hub.connected;
+        status.peer_sessions = hub.peers;
+      } catch (e) {
+        status.connected = false;
+        status.error = `Could not reach the hub: ${e.message}`;
+      }
+    } else {
+      status.connected = false;
+      status.error = "Still negotiating which session owns the browser.";
+    }
+    return { content: [{ type: "text", text: JSON.stringify(status, null, 2) }] };
   }
 );
 

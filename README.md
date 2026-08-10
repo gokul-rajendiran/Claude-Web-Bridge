@@ -106,29 +106,41 @@ Re-run the install command to get the latest version:
 TOKEN=<your-token> bash <(curl -sH "Authorization: token <your-token>" https://raw.githubusercontent.com/gokul2507/Claude-Web-Bridge/main/install.sh)
 ```
 
-## One session at a time
+## Multiple Claude sessions
 
-Each Claude session starts its own bridge server, but only one process can own
-port 7862 and the extension's single WebSocket. **The browser tools work in one
-Claude session at a time** — whichever session's server bound the port first.
+Several Claude sessions can drive the same browser at once. The extension holds
+one WebSocket to one port, so the servers arrange themselves automatically:
 
-Other sessions report `Server "claude-web-bridge" is not connected`, because
-their server exits on startup rather than lingering as a server that cannot
-reach the browser. That is the intended, diagnosable failure.
+```text
+Claude session A ──► bridge server (HUB) ◄──WebSocket──► Extension ──► Browser
+Claude session B ──► bridge server (peer) ──┘  forwards through the hub
+Claude session C ──► bridge server (peer) ──┘
+```
 
-If the server holding the port is orphaned or wedged (for example its Claude
-session is gone but the process survived), reclaim it by setting
-`CWB_TAKEOVER=1` in the `env` of your `~/.claude.json` entry, or find it with:
+- The first server to bind port 7862 becomes the **hub** and owns the extension.
+- Later servers become **peers** and forward their tool calls through the hub.
+- If the hub's session closes, a peer takes over the port and the extension
+  reconnects to it. No action needed.
+
+The browser tools behave identically either way. `bridge_status` reports which
+role a server has, plus `peer_sessions` on the hub, if you want to see the
+arrangement.
+
+### Reclaiming a wedged port
+
+If a server holds port 7862 but is unresponsive (for example its Claude session
+is gone but the process survived), reclaim it with `CWB_TAKEOVER=1` in the `env`
+of your `~/.claude.json` entry, or find it with:
 
 ```bash
 lsof -ti :7862 -sTCP:LISTEN
 ```
 
-Takeover is opt-in on purpose. It used to be unconditional, which made two
+Takeover is opt-in on purpose. It used to be unconditional, which made
 concurrent sessions kill each other's servers in a loop.
 
 ## Troubleshooting
 
 - **Extension shows red badge** — MCP server isn't running. Make sure Claude Code is open and the MCP config is correct.
-- **"Browser extension is not connected"** — Click the extension icon and hit Connect. If several Claude sessions are open, see [One session at a time](#one-session-at-a-time).
+- **"Browser extension is not connected"** — Click the extension icon and hit Connect. If several Claude sessions are open, see [Multiple Claude sessions](#multiple-claude-sessions).
 - **Tools timeout** — Some pages block scripting (e.g., `chrome://` URLs). Try a different tab.
