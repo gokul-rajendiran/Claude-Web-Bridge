@@ -142,7 +142,12 @@ async function sendToExtension(action, params = {}, timeoutMs = 30000, maxRetrie
 }
 
 // ── Shared tabId schema ───────────────────────────────────────────────────
-const tabIdParam = zNum.optional().describe("Target tab ID (from get_tabs). Omit to use the active tab.");
+const tabIdParam = zNum.optional().describe(
+  "Target tab ID (from get_tabs). Omit to use the active tab. Passing a tabId acts on " +
+  "that tab without focusing or switching to it, so it does not disturb what the user " +
+  "is looking at. Tab IDs are not stable across reloads — re-check with get_tabs if a " +
+  "tab may have navigated."
+);
 
 // ── MCP Server ─────────────────────────────────────────────────────────────
 const server = new McpServer({
@@ -205,7 +210,11 @@ server.tool(
 // Tool: query selector
 server.tool(
   "query_selector",
-  "Query DOM elements matching a CSS selector. Returns text, attributes, and bounding box.",
+  "Query DOM elements matching a CSS selector. Each result includes text, attributes, " +
+  "childCount, boundingBox, and a `visible` flag (false for zero-size elements). Use " +
+  "`visible` to tell a rendered element from an offscreen template clone — apps often " +
+  "keep hidden 0x0 template copies of dialogs in the DOM alongside the live one. " +
+  "Returns `matched` (total hits) and `showing` (returned after the limit).",
   {
     selector: z.string().describe("CSS selector to query"),
     limit: zNum.optional().describe("Max results (default 50)"),
@@ -331,9 +340,30 @@ server.tool(
 // Tool: execute JavaScript
 server.tool(
   "execute_js",
-  "Execute custom JavaScript on a page and return the result",
+  "Execute custom JavaScript in a page and return a structured result.\n" +
+  "\n" +
+  "Realm: runs in the page's MAIN world, so it sees the page's own globals, " +
+  "frameworks, and functions — not an isolated sandbox.\n" +
+  "\n" +
+  "State: values you set on `window.*` PERSIST across separate execute_js calls, so " +
+  "instrumentation can be installed in one call and read in a later one. This state " +
+  "does NOT survive a page load; a reload silently discards it.\n" +
+  "\n" +
+  "Result shape: `{ok: true, value, navigationId, documentChanged}` on success, or " +
+  "`{ok: false, error: {reason, message, stack}, ...}` on failure. `reason` is one of " +
+  "exception | syntax | evaluation | no_result. Errors are never reported as a " +
+  "successful null.\n" +
+  "\n" +
+  "Detecting lost state: `navigationId` increments when the document is replaced, and " +
+  "`documentChanged: true` means the page navigated since your previous call — treat " +
+  "anything you injected earlier as gone rather than assuming it is still installed.\n" +
+  "\n" +
+  "Return values must be JSON-serializable; non-serializable values come back as " +
+  "`{__unserializable: \"...\"}` instead of being silently dropped. Output is not " +
+  "size-capped, so avoid returning large DOM dumps (e.g. mapping every element in " +
+  "document.body) — select and shape the data in-page instead.",
   {
-    code: z.string().describe("JavaScript code to execute (must return a value or a Promise)"),
+    code: z.string().describe("JavaScript code to execute. `await` is available at top level; return a value or a Promise."),
     tabId: tabIdParam,
   },
   async ({ code, tabId }) => {
@@ -399,7 +429,10 @@ server.tool(
 // Tool: wait for element
 server.tool(
   "wait_for_element",
-  "Wait for an element to appear on a page",
+  "Wait for an element matching a selector to be present in the DOM. Note this tests " +
+  "presence, not visibility: it resolves immediately for a hidden 0x0 template that " +
+  "matches the selector. To wait for something the user can actually see, poll " +
+  "query_selector and check its `visible` flag.",
   {
     selector: z.string().describe("CSS selector to wait for"),
     timeout: zNum.optional().describe("Max wait time in ms (default 10000)"),

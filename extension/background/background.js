@@ -86,6 +86,34 @@ function updateBadge(connected) {
   chrome.action.setBadgeText({ text });
 }
 
+// ── execute_js document tracking ───────────────────────────────────────────
+// A page reload destroys everything execute_js injected into window.*, and
+// nothing in a plain result would reveal that. We stamp a token on the page
+// realm and compare it across calls, so each response can tell the caller
+// whether it is still talking to the same document.
+const docTokens = new Map();  // tabId -> last token seen in the page
+const navCounters = new Map(); // tabId -> monotonic document epoch
+
+function trackDocument(tabId, token) {
+  const previous = docTokens.get(tabId);
+  let navigationId = navCounters.get(tabId) ?? 1;
+
+  if (previous !== token) {
+    // First call against this tab, or the document was replaced.
+    if (previous !== undefined) navigationId += 1;
+    docTokens.set(tabId, token);
+    navCounters.set(tabId, navigationId);
+    return { navigationId, documentChanged: previous !== undefined };
+  }
+  return { navigationId, documentChanged: false };
+}
+
+// Forget tracking for tabs that no longer exist, so ids never go stale.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  docTokens.delete(tabId);
+  navCounters.delete(tabId);
+});
+
 // ── Get Active Tab ─────────────────────────────────────────────────────────
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -380,37 +408,103 @@ async function handleAction(action, params) {
     }
 
     case "executeJs": {
-      // Use chrome.debugger Runtime.evaluate for proper async/await and return value support
+      // chrome.debugger Runtime.evaluate runs in the page's MAIN world, which is
+      // what makes window.* state persist across calls. There is deliberately no
+      // chrome.scripting fallback: that runs in an ISOLATED world, so falling
+      // back would silently relocate the caller's code to a realm where its own
+      // injected state does not exist, and report success.
       const jsTarget = { tabId };
-      // Wrap code in an async IIFE so await works, and auto-return last expression
-      const wrappedCode = `(async () => { ${params.code} })()`;
+      // The caller's code is wrapped so a page-thrown error comes back as data
+      // rather than collapsing into an indistinguishable null.
+      const wrappedCode = `(async () => {
+        if (!window.__cwbDocToken) {
+          window.__cwbDocToken = Math.random().toString(36).slice(2) + "-" + performance.timeOrigin;
+        }
+        var __token = window.__cwbDocToken;
+        function __safe(v) {
+          if (v === undefined) return null;
+          try {
+            // Functions and symbols stringify to undefined WITHOUT throwing, so
+            // checking the result is required — a bare try/catch would let them
+            // disappear from the envelope entirely.
+            if (JSON.stringify(v) === undefined) {
+              return { __unserializable: Object.prototype.toString.call(v) };
+            }
+            return v;
+          } catch (e) {
+            return { __unserializable: Object.prototype.toString.call(v), reason: String(e && e.message || e) };
+          }
+        }
+        try {
+          var __value = await (async () => { ${params.code} })();
+          return { token: __token, ok: true, value: __safe(__value) };
+        } catch (e) {
+          return {
+            token: __token,
+            ok: false,
+            error: {
+              reason: "exception",
+              message: String((e && e.message) || e),
+              stack: (e && e.stack) ? String(e.stack) : null,
+            },
+          };
+        }
+      })()`;
+
+      let evalResult;
       try {
         await chrome.debugger.attach(jsTarget, "1.3");
-        const evalResult = await chrome.debugger.sendCommand(jsTarget, "Runtime.evaluate", {
+        evalResult = await chrome.debugger.sendCommand(jsTarget, "Runtime.evaluate", {
           expression: wrappedCode,
           awaitPromise: true,
           returnByValue: true,
           timeout: 25000,
         });
-        await chrome.debugger.detach(jsTarget);
-        if (evalResult.exceptionDetails) {
-          const errMsg = evalResult.exceptionDetails.exception?.description
-            || evalResult.exceptionDetails.text || "JS execution error";
-          throw new Error(errMsg);
-        }
-        const val = evalResult.result?.value;
-        return val === undefined ? null : val;
       } catch (e) {
+        throw new Error(
+          `execute_js could not evaluate in tab ${tabId}: ${e.message}. ` +
+          `The debugger may be unavailable (DevTools open, another debugger attached, ` +
+          `or a restricted page such as chrome:// or the Chrome Web Store).`
+        );
+      } finally {
         try { await chrome.debugger.detach(jsTarget); } catch {}
-        // Fallback to executeInTab for simpler cases
-        return executeInTab(tabId, (code) => {
-          var fn = new Function(code);
-          var result = fn();
-          if (result === undefined) return null;
-          if (typeof result === 'object') return JSON.parse(JSON.stringify(result));
-          return result;
-        }, [params.code]);
       }
+
+      // The wrapper catches page exceptions itself, so exceptionDetails here means
+      // the wrapper never ran — a syntax error in the caller's code, or a timeout.
+      if (evalResult?.exceptionDetails) {
+        const d = evalResult.exceptionDetails;
+        return {
+          ok: false,
+          error: {
+            reason: d.exception?.className === "SyntaxError" ? "syntax" : "evaluation",
+            message: d.exception?.description || d.text || "JS evaluation failed",
+            stack: null,
+          },
+          tabId,
+        };
+      }
+
+      const payload = evalResult?.result?.value;
+      if (!payload || typeof payload !== "object" || !("token" in payload)) {
+        // returnByValue could not serialize the envelope, or the document was
+        // torn down mid-call. Either way it is not a successful null.
+        return {
+          ok: false,
+          error: {
+            reason: "no_result",
+            message: "execute_js returned no usable envelope; the page may have navigated mid-call.",
+            stack: null,
+          },
+          tabId,
+        };
+      }
+
+      const { navigationId, documentChanged } = trackDocument(tabId, payload.token);
+      const out = { ok: payload.ok, navigationId, documentChanged, tabId };
+      if (payload.ok) out.value = payload.value;
+      else out.error = payload.error;
+      return out;
     }
 
     case "setContentEditable":

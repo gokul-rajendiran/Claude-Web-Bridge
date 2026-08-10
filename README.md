@@ -24,15 +24,25 @@ This downloads everything to `~/.claude-web-bridge/`.
 
 ### 1. MCP Server
 
-Add this to your `~/.claude.json` inside `"mcpServers"`:
+Add this to your `~/.claude.json` inside `"mcpServers"`, replacing
+`/Users/YOUR_USERNAME` with your real home directory (`echo $HOME`):
 
 ```json
 "claude-web-bridge": {
   "command": "node",
-  "args": ["~/.claude-web-bridge/server/index.mjs"],
-  "cwd": "~/.claude-web-bridge/server"
+  "args": ["/Users/YOUR_USERNAME/.claude-web-bridge/server/index.mjs"],
+  "cwd": "/Users/YOUR_USERNAME/.claude-web-bridge/server"
 }
 ```
+
+> **Use absolute paths.** `~` is expanded by your shell, and there is no shell
+> here — Node receives a literal `~` and fails with `ENOENT`.
+>
+> **Register the server in exactly one place.** Do not also add a
+> `.mcp.json` in a project directory. Two registrations start two servers
+> that fight over port 7862; the loser exits, and if it is the one your
+> session is attached to, every tool reports that the extension is not
+> connected even though the browser is fine.
 
 Then restart Claude Code.
 
