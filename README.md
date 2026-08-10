@@ -106,8 +106,29 @@ Re-run the install command to get the latest version:
 TOKEN=<your-token> bash <(curl -sH "Authorization: token <your-token>" https://raw.githubusercontent.com/gokul2507/Claude-Web-Bridge/main/install.sh)
 ```
 
+## One session at a time
+
+Each Claude session starts its own bridge server, but only one process can own
+port 7862 and the extension's single WebSocket. **The browser tools work in one
+Claude session at a time** — whichever session's server bound the port first.
+
+Other sessions report `Server "claude-web-bridge" is not connected`, because
+their server exits on startup rather than lingering as a server that cannot
+reach the browser. That is the intended, diagnosable failure.
+
+If the server holding the port is orphaned or wedged (for example its Claude
+session is gone but the process survived), reclaim it by setting
+`CWB_TAKEOVER=1` in the `env` of your `~/.claude.json` entry, or find it with:
+
+```bash
+lsof -ti :7862 -sTCP:LISTEN
+```
+
+Takeover is opt-in on purpose. It used to be unconditional, which made two
+concurrent sessions kill each other's servers in a loop.
+
 ## Troubleshooting
 
 - **Extension shows red badge** — MCP server isn't running. Make sure Claude Code is open and the MCP config is correct.
-- **"Browser extension is not connected"** — Click the extension icon and hit Connect.
+- **"Browser extension is not connected"** — Click the extension icon and hit Connect. If several Claude sessions are open, see [One session at a time](#one-session-at-a-time).
 - **Tools timeout** — Some pages block scripting (e.g., `chrome://` URLs). Try a different tab.

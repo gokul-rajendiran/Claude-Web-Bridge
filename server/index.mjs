@@ -13,35 +13,52 @@ let pendingRequests = new Map();
 let requestId = 0;
 const WS_PORT = 7862;
 
-// ── Kill any stale process on the port before starting ────────────────────
-import { execSync } from "child_process";
-try {
-  // -sTCP:LISTEN so we only match the stale server, not clients (e.g. Chrome)
-  // holding an established connection to the port.
-  const pids = execSync(`lsof -ti :${WS_PORT} -sTCP:LISTEN 2>/dev/null`).toString().trim();
-  if (pids) {
-    for (const pid of pids.split("\n")) {
-      if (pid && Number(pid) !== process.pid) {
-        try { process.kill(Number(pid), "SIGTERM"); } catch {}
+// ── Optional takeover of the port ─────────────────────────────────────────
+// This used to unconditionally SIGTERM whoever held the port. One server per
+// Claude session plus that kill turned two concurrent sessions into a war: each
+// new server killed the incumbent, whose client restarted it, which killed the
+// new one, forever. The extension followed the winner around and every session
+// saw intermittent "extension is not connected".
+//
+// A crashed process releases its listening socket, so a truly dead server never
+// holds the port — only a live one does, and killing that is what caused the
+// thrashing. So default to leaving it alone. Set CWB_TAKEOVER=1 to reclaim the
+// port from a wedged or orphaned server.
+if (process.env.CWB_TAKEOVER === "1") {
+  const { execSync } = await import("child_process");
+  try {
+    // -sTCP:LISTEN so we only match the server, not clients (e.g. Chrome)
+    // holding an established connection to the port.
+    const pids = execSync(`lsof -ti :${WS_PORT} -sTCP:LISTEN 2>/dev/null`).toString().trim();
+    if (pids) {
+      for (const pid of pids.split("\n")) {
+        if (pid && Number(pid) !== process.pid) {
+          try { process.kill(Number(pid), "SIGTERM"); } catch {}
+        }
       }
+      await new Promise(r => setTimeout(r, 500));
+      console.error(`[claude-web-bridge] CWB_TAKEOVER=1 — killed process(es) holding port ${WS_PORT}`);
     }
-    await new Promise(r => setTimeout(r, 500));
-    console.error(`[claude-web-bridge] Killed stale process(es) on port ${WS_PORT}`);
-  }
-} catch {}
+  } catch {}
+}
 
 // ── WebSocket Server (extension connects here) ────────────────────────────
 const wss = new WebSocketServer({ port: WS_PORT });
 
 wss.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
-    // Another instance owns the port, so the extension is connected to it, not
-    // us. Staying alive would leave a deaf server whose tools all report
-    // "extension is not connected" — exit loudly so the client shows a failure.
+    // Another live server owns the port and therefore owns the extension. We
+    // cannot serve the browser, and staying alive would leave a deaf server
+    // whose every tool reports "extension is not connected" — a symptom that
+    // sends users to the browser, where nothing is wrong. Exit instead, so the
+    // client reports a failed server.
     console.error(
-      `[claude-web-bridge] Port ${WS_PORT} is already in use even after cleanup. ` +
-      `Another claude-web-bridge instance is already running — this one is exiting. ` +
-      `Check for a duplicate registration in ~/.claude.json and .mcp.json.`
+      `[claude-web-bridge] Port ${WS_PORT} is already held by another claude-web-bridge ` +
+      `server, which owns the browser extension. This instance is exiting.\n` +
+      `  The bridge currently supports one Claude session at a time. Use the browser ` +
+      `tools from the session that started first.\n` +
+      `  If that server is orphaned or wedged, reclaim the port with ` +
+      `CWB_TAKEOVER=1 in this server's env, or find it with: lsof -ti :${WS_PORT} -sTCP:LISTEN`
     );
     process.exit(1);
   }
@@ -55,8 +72,12 @@ wss.on("listening", () => {
 wss.on("connection", (ws) => {
   console.error("[claude-web-bridge] Extension connected");
   extensionSocket = ws;
+  ws.lastSeenAt = Date.now();
+
+  ws.on("pong", () => { ws.lastSeenAt = Date.now(); });
 
   ws.on("message", (raw) => {
+    ws.lastSeenAt = Date.now();
     try {
       const msg = JSON.parse(raw.toString());
       // Ignore keepalive pings from the extension
@@ -88,6 +109,30 @@ wss.on("connection", (ws) => {
     }
   });
 });
+
+// ── Heartbeat: detect a socket the extension has silently abandoned ───────
+// Chrome suspends MV3 service workers, which can leave a half-open socket that
+// the OS still reports as ESTABLISHED while no messages ever arrive. Without
+// this, bridge_status reports a connection that cannot actually answer, and
+// every tool call waits for a timeout instead of failing fast. The extension
+// pings every 18s (chrome.alarms), so 60s of silence means two missed pings.
+const HEARTBEAT_INTERVAL_MS = 20000;
+const HEARTBEAT_TIMEOUT_MS = 60000;
+
+setInterval(() => {
+  const ws = extensionSocket;
+  if (!ws) return;
+  if (Date.now() - (ws.lastSeenAt || 0) > HEARTBEAT_TIMEOUT_MS) {
+    console.error(
+      `[claude-web-bridge] Extension socket silent for over ${HEARTBEAT_TIMEOUT_MS / 1000}s ` +
+      `— dropping it so the extension can reconnect.`
+    );
+    try { ws.terminate(); } catch {}
+    // terminate() fires "close", which clears extensionSocket via the guard there.
+    return;
+  }
+  try { ws.ping(); } catch {}
+}, HEARTBEAT_INTERVAL_MS).unref();
 
 // ── Helper: send command to extension and await response ──────────────────
 function sendToExtensionOnce(action, params = {}, timeoutMs = 30000) {
