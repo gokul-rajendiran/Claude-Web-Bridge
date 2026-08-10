@@ -16,7 +16,9 @@ const WS_PORT = 7862;
 // ── Kill any stale process on the port before starting ────────────────────
 import { execSync } from "child_process";
 try {
-  const pids = execSync(`lsof -ti :${WS_PORT} 2>/dev/null`).toString().trim();
+  // -sTCP:LISTEN so we only match the stale server, not clients (e.g. Chrome)
+  // holding an established connection to the port.
+  const pids = execSync(`lsof -ti :${WS_PORT} -sTCP:LISTEN 2>/dev/null`).toString().trim();
   if (pids) {
     for (const pid of pids.split("\n")) {
       if (pid && Number(pid) !== process.pid) {
@@ -33,10 +35,17 @@ const wss = new WebSocketServer({ port: WS_PORT });
 
 wss.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
-    console.error(`[claude-web-bridge] Port ${WS_PORT} is already in use even after cleanup.`);
-  } else {
-    console.error("[claude-web-bridge] WebSocket server error:", err.message);
+    // Another instance owns the port, so the extension is connected to it, not
+    // us. Staying alive would leave a deaf server whose tools all report
+    // "extension is not connected" — exit loudly so the client shows a failure.
+    console.error(
+      `[claude-web-bridge] Port ${WS_PORT} is already in use even after cleanup. ` +
+      `Another claude-web-bridge instance is already running — this one is exiting. ` +
+      `Check for a duplicate registration in ~/.claude.json and .mcp.json.`
+    );
+    process.exit(1);
   }
+  console.error("[claude-web-bridge] WebSocket server error:", err.message);
 });
 
 wss.on("listening", () => {
@@ -67,6 +76,10 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
+    // A reconnecting extension can leave an old socket closing after the new
+    // one is live — only tear down state if the socket that closed is current.
+    if (extensionSocket !== ws) return;
+
     console.error("[claude-web-bridge] Extension disconnected");
     extensionSocket = null;
     for (const [id, pending] of pendingRequests) {

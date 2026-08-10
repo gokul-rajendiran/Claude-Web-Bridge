@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "claude-web-bridge": {
-      "command": "node",
-      "args": ["server/index.mjs"],
-      "cwd": "."
-    }
-  }
-}
