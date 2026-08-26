@@ -116,9 +116,16 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 // ── Get Active Tab ─────────────────────────────────────────────────────────
 async function getActiveTab() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab) throw new Error("No active tab found");
-  return tab;
+  // lastFocusedWindow, not currentWindow: a service worker has no window of its
+  // own, so "current" is ill-defined and can pin to the wrong window when
+  // several are open. The last-focused window is the one the user is actually
+  // looking at.
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (tab) return tab;
+  // Fallback (e.g. the last-focused window was just closed): any active tab.
+  const [anyTab] = await chrome.tabs.query({ active: true });
+  if (!anyTab) throw new Error("No active tab found");
+  return anyTab;
 }
 
 // ── Execute in content script context ──────────────────────────────────────
@@ -778,6 +785,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ok: true });
   }
   return true;
+});
+
+// ── Focus reporting ────────────────────────────────────────────────────────
+// The server can hold connections from several browser profiles at once and
+// sends tab-less commands to whichever browser the user focused last. Telling
+// it about focus changes is what keeps that routing accurate.
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return; // focus left this browser
+  if (socket && socket.readyState === 1) {
+    socket.send(JSON.stringify({ type: "focus" }));
+  }
 });
 
 // ── Keepalive: prevent MV3 service worker suspension ────────────────────

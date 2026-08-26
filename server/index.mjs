@@ -8,10 +8,21 @@ const zNum = z.preprocess((v) => (typeof v === "string" ? Number(v) : v), z.numb
 import { WebSocket, WebSocketServer } from "ws";
 
 // ── State ──────────────────────────────────────────────────────────────────
-let extensionSocket = null;
+// Several browser profiles can be connected at once — each Chrome profile runs
+// its own copy of the extension and opens its own socket. Tabs are routed to
+// the connection that owns them; ignoring all but one socket is what used to
+// make every window outside the last-connected profile invisible.
+const extensions = new Map();   // connId -> extension WebSocket
+let extNextConnId = 0;
+let lastFocusedConnId = null;   // which browser the user touched last
+const tabRoutes = new Map();    // tabId -> connId that owns the tab
 let pendingRequests = new Map();
 let requestId = 0;
-const WS_PORT = 7862;
+// This session's default tab. Each Claude session runs its own server process,
+// so this is naturally per-session state — it lets concurrent sessions work in
+// different tabs without fighting over the browser's single focused tab.
+let sessionTabId = null;
+const WS_PORT = Number(process.env.CWB_PORT || 7862);
 
 // ── Optional takeover of the port ─────────────────────────────────────────
 // This used to unconditionally SIGTERM whoever held the port. One server per
@@ -59,7 +70,6 @@ let role = null;             // "hub" | "peer" | null while negotiating
 let wss = null;              // hub: the WebSocket server
 let hubSocket = null;        // peer: our client connection to the hub
 const peerSockets = new Set();  // hub: connected peer servers
-const hubRelays = new Map();    // hub: our request id -> peer awaiting the reply
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -96,8 +106,13 @@ function setupHub() {
 }
 
 function attachExtension(ws) {
-  console.error("[claude-web-bridge] Extension connected");
-  extensionSocket = ws;
+  const connId = ++extNextConnId;
+  ws.connId = connId;
+  extensions.set(connId, ws);
+  // Best guess until a focus event arrives: the browser that connected most
+  // recently is the one the user is looking at.
+  lastFocusedConnId = connId;
+  console.error(`[claude-web-bridge] Extension connected (browser ${connId}, ${extensions.size} total)`);
   ws.lastSeenAt = Date.now();
 
   ws.on("pong", () => { ws.lastSeenAt = Date.now(); });
@@ -108,17 +123,8 @@ function attachExtension(ws) {
       const msg = JSON.parse(raw.toString());
       // Ignore keepalive pings from the extension
       if (msg.type === "ping") return;
-
-      // A reply to a request we relayed on some peer's behalf goes back to it.
-      const relay = hubRelays.get(msg.id);
-      if (relay) {
-        clearTimeout(relay.timeout);
-        hubRelays.delete(msg.id);
-        sendJson(relay.peerWs, {
-          type: "response", id: relay.peerRequestId, result: msg.result, error: msg.error,
-        });
-        return;
-      }
+      // The user focused a window of this browser — make it the default target.
+      if (msg.type === "focus") { lastFocusedConnId = connId; return; }
 
       const pending = pendingRequests.get(msg.id);
       if (pending) {
@@ -132,22 +138,118 @@ function attachExtension(ws) {
   });
 
   ws.on("close", () => {
-    // A reconnecting extension can leave an old socket closing after the new
-    // one is live — only tear down state if the socket that closed is current.
-    if (extensionSocket !== ws) return;
-
-    console.error("[claude-web-bridge] Extension disconnected");
-    extensionSocket = null;
+    extensions.delete(connId);
+    console.error(`[claude-web-bridge] Extension disconnected (browser ${connId}, ${extensions.size} left)`);
+    // Only fail the requests that were waiting on THIS browser.
     for (const [id, pending] of pendingRequests) {
-      pending.reject(new Error("Extension disconnected"));
-      pendingRequests.delete(id);
+      if (pending.connId === connId) {
+        pendingRequests.delete(id);
+        pending.reject(new Error("Extension disconnected"));
+      }
     }
-    for (const [id, relay] of hubRelays) {
-      clearTimeout(relay.timeout);
-      hubRelays.delete(id);
-      sendJson(relay.peerWs, { type: "response", id: relay.peerRequestId, error: "Extension disconnected" });
+    for (const [tabId, owner] of tabRoutes) {
+      if (owner === connId) tabRoutes.delete(tabId);
+    }
+    if (lastFocusedConnId === connId) {
+      const remaining = [...liveExtensions()];
+      lastFocusedConnId = remaining.length ? remaining[remaining.length - 1].connId : null;
     }
   });
+}
+
+function* liveExtensions() {
+  for (const ws of extensions.values()) {
+    if (ws.readyState === 1) yield ws;
+  }
+}
+
+// Send one request to one extension socket and await its reply.
+function sendToConn(ws, action, params = {}, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const id = ++requestId;
+    const timeout = setTimeout(() => {
+      pendingRequests.delete(id);
+      reject(new Error(`Request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    pendingRequests.set(id, {
+      connId: ws.connId,
+      resolve: (v) => { clearTimeout(timeout); resolve(v); },
+      reject: (e) => { clearTimeout(timeout); reject(e); },
+    });
+    try {
+      ws.send(JSON.stringify({ id, action, params }));
+    } catch (e) {
+      clearTimeout(timeout);
+      pendingRequests.delete(id);
+      reject(e);
+    }
+  });
+}
+
+// Ask every connected browser for its tabs, merge, and refresh tab routing.
+// Partial answers are fine — a browser that fails to answer just contributes
+// nothing rather than failing the whole call.
+async function mergedGetTabs(timeoutMs = 10000) {
+  const live = [...liveExtensions()];
+  const settled = await Promise.allSettled(
+    live.map((ws) =>
+      sendToConn(ws, "getTabs", {}, Math.min(timeoutMs, 10000)).then((tabs) => ({ ws, tabs })))
+  );
+  const answers = settled.filter((s) => s.status === "fulfilled").map((s) => s.value);
+  if (answers.length === 0) {
+    throw settled[0]?.reason || new Error(EXT_NOT_CONNECTED);
+  }
+  const merged = [];
+  for (const { ws, tabs } of answers) {
+    for (const t of tabs) {
+      tabRoutes.set(t.id, ws.connId);
+      merged.push({ ...t, browserId: ws.connId });
+    }
+  }
+  return merged;
+}
+
+// Hub-side dispatch: pick the extension socket that should handle this action.
+// Explicit tabIds route to the browser that owns the tab; everything else goes
+// to the browser the user focused last.
+async function dispatchToBrowser(action, params = {}, timeoutMs = 30000) {
+  let live = [...liveExtensions()];
+  if (live.length === 0) throw new Error(EXT_NOT_CONNECTED);
+
+  if (action === "getTabs") return mergedGetTabs(timeoutMs);
+
+  let target = null;
+  if (params.tabId != null) {
+    let owner = tabRoutes.get(params.tabId);
+    if (owner == null || !extensions.get(owner) || extensions.get(owner).readyState !== 1) {
+      // Route unknown or stale — rebuild routes and look again.
+      await mergedGetTabs(5000).catch(() => {});
+      owner = tabRoutes.get(params.tabId);
+      live = [...liveExtensions()]; // a browser may have dropped during the refresh
+    }
+    if (owner != null && extensions.get(owner)?.readyState === 1) {
+      target = extensions.get(owner);
+    } else if (live.length === 1) {
+      // A single browser can answer for its own tabs (it may be mid-navigation
+      // and missing from the last snapshot); let it report its own error.
+      target = live[0];
+    } else {
+      throw new Error(
+        `Tab ${params.tabId} was not found in any connected browser ` +
+        `(${live.length} connected). It may have been closed — use get_tabs to list current tabs.`
+      );
+    }
+  } else {
+    target = extensions.get(lastFocusedConnId);
+    if (!target || target.readyState !== 1) target = live[live.length - 1];
+  }
+
+  const result = await sendToConn(target, action, params, timeoutMs);
+  // Results that name a tab teach us its route (e.g. navigate with newTab).
+  if (result && typeof result === "object" && typeof result.tabId === "number") {
+    tabRoutes.set(result.tabId, target.connId);
+  }
+  return result;
 }
 
 function attachPeer(ws) {
@@ -161,7 +263,10 @@ function attachPeer(ws) {
     if (msg.type === "status") {
       sendJson(ws, {
         type: "response", id: msg.id,
-        result: { connected: isExtensionLive(), role: "hub", peers: peerSockets.size },
+        result: {
+          connected: isExtensionLive(), role: "hub",
+          peers: peerSockets.size, browsers: [...liveExtensions()].length,
+        },
       });
       return;
     }
@@ -170,29 +275,17 @@ function attachPeer(ws) {
 
   ws.on("close", () => {
     peerSockets.delete(ws);
-    // Drop relays belonging to this peer; nobody is waiting for them now.
-    for (const [id, relay] of hubRelays) {
-      if (relay.peerWs === ws) { clearTimeout(relay.timeout); hubRelays.delete(id); }
-    }
     console.error(`[claude-web-bridge] Peer session disconnected (${peerSockets.size} peer(s))`);
   });
 }
 
 function relayPeerRequest(peerWs, msg) {
-  if (!isExtensionLive()) {
-    sendJson(peerWs, { type: "response", id: msg.id, error: EXT_NOT_CONNECTED });
-    return;
-  }
-  const timeoutMs = msg.timeoutMs || 30000;
-  const id = ++requestId;
   // Give the peer's own timer the first chance to fire, so the caller sees its
   // own timeout rather than a racing one from here.
-  const timeout = setTimeout(() => {
-    hubRelays.delete(id);
-    sendJson(peerWs, { type: "response", id: msg.id, error: `Request timed out after ${timeoutMs}ms` });
-  }, timeoutMs + 2000);
-  hubRelays.set(id, { peerWs, peerRequestId: msg.id, timeout });
-  sendJson(extensionSocket, { id, action: msg.action, params: msg.params });
+  const timeoutMs = (msg.timeoutMs || 30000) + 2000;
+  dispatchToBrowser(msg.action, msg.params || {}, timeoutMs)
+    .then((result) => sendJson(peerWs, { type: "response", id: msg.id, result }))
+    .catch((err) => sendJson(peerWs, { type: "response", id: msg.id, error: err.message }));
 }
 
 // ── Peer side ─────────────────────────────────────────────────────────────
@@ -279,7 +372,8 @@ function requestHubStatus() {
 
 // ── Role negotiation ──────────────────────────────────────────────────────
 function isExtensionLive() {
-  return !!extensionSocket && extensionSocket.readyState === 1;
+  for (const _ of liveExtensions()) return true;
+  return false;
 }
 
 function sendJson(ws, payload) {
@@ -335,54 +429,33 @@ const HEARTBEAT_INTERVAL_MS = 20000;
 const HEARTBEAT_TIMEOUT_MS = 60000;
 
 setInterval(() => {
-  if (role !== "hub") return;  // only the hub holds the extension socket
-  const ws = extensionSocket;
-  if (!ws) return;
-  if (Date.now() - (ws.lastSeenAt || 0) > HEARTBEAT_TIMEOUT_MS) {
-    console.error(
-      `[claude-web-bridge] Extension socket silent for over ${HEARTBEAT_TIMEOUT_MS / 1000}s ` +
-      `— dropping it so the extension can reconnect.`
-    );
-    try { ws.terminate(); } catch {}
-    // terminate() fires "close", which clears extensionSocket via the guard there.
-    return;
+  if (role !== "hub") return;  // only the hub holds extension sockets
+  for (const ws of extensions.values()) {
+    if (Date.now() - (ws.lastSeenAt || 0) > HEARTBEAT_TIMEOUT_MS) {
+      console.error(
+        `[claude-web-bridge] Extension socket (browser ${ws.connId}) silent for over ` +
+        `${HEARTBEAT_TIMEOUT_MS / 1000}s — dropping it so the extension can reconnect.`
+      );
+      // terminate() fires "close", which cleans up state for this connection.
+      try { ws.terminate(); } catch {}
+      continue;
+    }
+    try { ws.ping(); } catch {}
   }
-  try { ws.ping(); } catch {}
 }, HEARTBEAT_INTERVAL_MS).unref();
 
 await negotiateRole();
 
 // ── Helper: send command to extension and await response ──────────────────
 function sendToExtensionOnce(action, params = {}, timeoutMs = 30000) {
-  // A peer does not hold the extension socket — the hub does. Forward instead.
+  // A peer does not hold the extension sockets — the hub does. Forward instead.
   if (role === "peer") return sendViaHub(action, params, timeoutMs);
   if (role === null) {
     return Promise.reject(new Error(
       "Bridge is still deciding which session owns the browser. Retry in a moment."
     ));
   }
-  return new Promise((resolve, reject) => {
-    if (!isExtensionLive()) {
-      reject(new Error(EXT_NOT_CONNECTED));
-      return;
-    }
-    const id = ++requestId;
-    pendingRequests.set(id, { resolve, reject });
-
-    const timeout = setTimeout(() => {
-      pendingRequests.delete(id);
-      reject(new Error(`Request timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    const origResolve = pendingRequests.get(id).resolve;
-    const origReject = pendingRequests.get(id).reject;
-    pendingRequests.set(id, {
-      resolve: (v) => { clearTimeout(timeout); origResolve(v); },
-      reject: (e) => { clearTimeout(timeout); origReject(e); },
-    });
-
-    extensionSocket.send(JSON.stringify({ id, action, params }));
-  });
+  return dispatchToBrowser(action, params, timeoutMs);
 }
 
 // Retry wrapper for transient errors (tab dragging, debugger busy, etc.)
@@ -395,12 +468,30 @@ const RETRYABLE_ERRORS = [
 ];
 
 async function sendToExtension(action, params = {}, timeoutMs = 30000, maxRetries = 3) {
+  // When the caller names no tab, target this session's bound tab (use_tab)
+  // rather than whatever tab happens to be focused — concurrent sessions each
+  // keep their own binding, so they can work in different tabs simultaneously.
+  let boundTabInjected = false;
+  if (params.tabId == null && sessionTabId != null && action !== "getTabs") {
+    params = { ...params, tabId: sessionTabId };
+    boundTabInjected = true;
+  }
+
   let lastError;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       return await sendToExtensionOnce(action, params, timeoutMs);
     } catch (err) {
       lastError = err;
+      if (boundTabInjected && /no longer exists|not found in any connected browser/.test(err.message)) {
+        const closed = sessionTabId;
+        sessionTabId = null;
+        throw new Error(
+          `This session's bound tab ${closed} no longer exists (it was probably closed); ` +
+          `the binding has been cleared. Call get_tabs and use_tab to bind a new tab, ` +
+          `or retry to target the active tab.`
+        );
+      }
       const isRetryable = RETRYABLE_ERRORS.some(msg => err.message.includes(msg));
       if (!isRetryable || attempt === maxRetries - 1) throw err;
       // Wait before retrying (exponential backoff: 500ms, 1000ms, 2000ms)
@@ -413,10 +504,12 @@ async function sendToExtension(action, params = {}, timeoutMs = 30000, maxRetrie
 
 // ── Shared tabId schema ───────────────────────────────────────────────────
 const tabIdParam = zNum.optional().describe(
-  "Target tab ID (from get_tabs). Omit to use the active tab. Passing a tabId acts on " +
-  "that tab without focusing or switching to it, so it does not disturb what the user " +
-  "is looking at. Tab IDs are not stable across reloads — re-check with get_tabs if a " +
-  "tab may have navigated."
+  "Target tab ID (from get_tabs). Omit to use this session's bound tab (see use_tab) " +
+  "or, if none is bound, the active tab of the last-focused browser window. Passing a " +
+  "tabId acts on that tab without focusing or switching to it, so it does not disturb " +
+  "what the user is looking at. When several browser profiles are connected, the tabId " +
+  "is routed to the browser that owns the tab automatically. Tab IDs are not stable " +
+  "across reloads — re-check with get_tabs if a tab may have navigated."
 );
 
 // ── MCP Server ─────────────────────────────────────────────────────────────
@@ -435,8 +528,10 @@ server.tool(
   {},
   async () => {
     const status = { ws_port: WS_PORT, role, pending_requests: pendingRequests.size };
+    status.session_bound_tab = sessionTabId;
     if (role === "hub") {
       status.connected = isExtensionLive();
+      status.browsers = [...liveExtensions()].length;
       status.peer_sessions = peerSockets.size;
     } else if (role === "peer") {
       status.hub_link = hubSocket && hubSocket.readyState === 1 ? "up" : "down";
@@ -444,6 +539,7 @@ server.tool(
       try {
         const hub = await requestHubStatus();
         status.connected = hub.connected;
+        status.browsers = hub.browsers;
         status.peer_sessions = hub.peers;
       } catch (e) {
         status.connected = false;
@@ -619,6 +715,12 @@ server.tool(
   },
   async ({ url, newTab, tabId }) => {
     const result = await sendToExtension("navigate", { url, newTab, tabId }, 30000);
+    // A tab this session just created becomes its default target, so parallel
+    // sessions can each open and drive their own tab without extra plumbing.
+    if (result?.newTab && typeof result.tabId === "number") {
+      sessionTabId = result.tabId;
+      result.note = `This session now targets tab ${result.tabId} by default (use_tab to change).`;
+    }
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -693,7 +795,11 @@ server.tool(
 // Tool: get tab info
 server.tool(
   "get_tabs",
-  "List all open browser tabs with their IDs, titles, and URLs. Use tab IDs to target specific tabs in other tools.",
+  "List all open browser tabs with their IDs, titles, and URLs — merged across every " +
+  "connected browser profile/window (each tab's browserId says which browser owns it). " +
+  "Use tab IDs to target specific tabs in other tools; they are routed to the right " +
+  "browser automatically. A Chrome profile only appears here if the extension is " +
+  "installed and connected in that profile.",
   {},
   async () => {
     const result = await sendToExtension("getTabs");
@@ -704,11 +810,44 @@ server.tool(
 // Tool: switch tab
 server.tool(
   "switch_tab",
-  "Switch to a different browser tab (makes it the active/visible tab)",
+  "Switch to a different browser tab (makes it the active/visible tab and focuses its " +
+  "window — this disturbs what the user is looking at). Also makes it this session's " +
+  "default tab. To work on a tab in the background instead, use use_tab.",
   { tabId: zNum.describe("Tab ID to switch to (get IDs from get_tabs)") },
   async ({ tabId }) => {
     const result = await sendToExtension("switchTab", { tabId });
+    sessionTabId = tabId;
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+// Tool: bind this session to a tab
+server.tool(
+  "use_tab",
+  "Bind this Claude session to a tab: every later tool call that omits tabId targets " +
+  "the bound tab instead of the focused one, without focusing or switching to it. This " +
+  "lets several Claude sessions work in different tabs of the same browser at the same " +
+  "time without interfering. Call with no tabId to clear the binding and go back to " +
+  "targeting the active tab.",
+  { tabId: zNum.optional().describe("Tab ID to bind (from get_tabs). Omit to clear the binding.") },
+  async ({ tabId }) => {
+    if (tabId == null) {
+      const previous = sessionTabId;
+      sessionTabId = null;
+      return { content: [{ type: "text", text: JSON.stringify({ cleared: true, previous }, null, 2) }] };
+    }
+    const tabs = await sendToExtension("getTabs");
+    const tab = tabs.find((t) => t.id === tabId);
+    if (!tab) {
+      throw new Error(`Tab ${tabId} was not found in any connected browser. Use get_tabs to list current tabs.`);
+    }
+    sessionTabId = tabId;
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({ bound: tabId, title: tab.title, url: tab.url, browserId: tab.browserId }, null, 2),
+      }],
+    };
   }
 );
 

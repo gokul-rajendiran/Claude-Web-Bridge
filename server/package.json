@@ -8,7 +8,8 @@
     "claude-web-bridge": "index.mjs"
   },
   "scripts": {
-    "start": "node index.mjs"
+    "start": "node index.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "keywords": ["mcp", "claude", "browser", "bridge", "extension", "web"],
   "author": "gokul2507",

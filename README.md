@@ -69,8 +69,9 @@ Then restart Claude Code.
 
 | Tool | Description |
 |------|-------------|
-| `get_tabs` | List all open browser tabs |
-| `switch_tab` | Switch to a specific tab |
+| `get_tabs` | List all open tabs across every connected browser profile |
+| `switch_tab` | Switch to a specific tab (focuses it — visible to the user) |
+| `use_tab` | Bind this session to a tab so later calls target it without focusing it |
 | `get_page_content` | Get full text content of a page |
 | `get_page_html` | Get HTML of a page or selector |
 | `get_page_metadata` | Get page metadata (title, meta tags, OpenGraph) |
@@ -106,6 +107,25 @@ Re-run the install command to get the latest version:
 TOKEN=<your-token> bash <(curl -sH "Authorization: token <your-token>" https://raw.githubusercontent.com/gokul2507/Claude-Web-Bridge/main/install.sh)
 ```
 
+## Multiple Chrome windows and profiles
+
+All windows of one Chrome profile are always visible — `get_tabs` lists every
+tab of every window, and each tab carries its `windowId`.
+
+Chrome **profiles** are separate browser instances: each profile runs its own
+copy of the extension, so a profile is only visible to Claude if the extension
+is loaded and connected **in that profile**. To control several profiles:
+
+1. In each profile, open `chrome://extensions`, enable Developer mode, and
+   **Load unpacked** → `~/.claude-web-bridge/extension` (repeat per profile).
+2. Click the extension icon in that profile and hit **Connect**.
+
+Every connected profile gets its own WebSocket to the bridge. `get_tabs` merges
+tabs from all of them and tags each tab with a `browserId`; tool calls that pass
+a `tabId` are routed to the profile that owns the tab automatically. Calls
+without a `tabId` go to the active tab of the browser window you focused last.
+`bridge_status` reports how many browsers are connected under `browsers`.
+
 ## Multiple Claude sessions
 
 Several Claude sessions can drive the same browser at once. The extension holds
@@ -125,6 +145,25 @@ Claude session C ──► bridge server (peer) ──┘
 The browser tools behave identically either way. `bridge_status` reports which
 role a server has, plus `peer_sessions` on the hub, if you want to see the
 arrangement.
+
+### Working in different tabs at the same time
+
+By default, a tool call that names no `tabId` targets the focused tab — which
+is shared, global state, so two sessions doing that would fight over it (and
+`switch_tab` steals focus from whatever the other session was doing).
+
+To let sessions work side by side, each session can bind its own default tab:
+
+- `use_tab <tabId>` — every later call from that session targets the bound tab
+  in the background, without focusing it or disturbing the other sessions.
+- `navigate` with `newTab: true` binds the session to the tab it just created,
+  so "open a tab and work in it" is isolated per session out of the box.
+- `switch_tab` also binds, but focuses the tab (user-visible).
+- `use_tab` with no arguments clears the binding.
+
+The binding lives in the session's own server process, so every session (hub or
+peer) keeps an independent one. If the bound tab is closed, the next call fails
+with a clear error and the binding resets.
 
 ### Reclaiming a wedged port
 
