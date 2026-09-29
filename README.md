@@ -12,10 +12,10 @@ Everything runs locally on your machine. No data leaves your computer.
 
 ## Quick Install
 
-Run this one command (you'll need a token from the project owner):
+Run this one command:
 
 ```bash
-TOKEN=<your-token> bash <(curl -sH "Authorization: token <your-token>" https://raw.githubusercontent.com/gokul2507/Claude-Web-Bridge/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/gokul2507/Claude-Web-Bridge/main/install.sh)
 ```
 
 This downloads everything to `~/.claude-web-bridge/`.
@@ -104,7 +104,7 @@ Then restart Claude Code.
 Re-run the install command to get the latest version:
 
 ```bash
-TOKEN=<your-token> bash <(curl -sH "Authorization: token <your-token>" https://raw.githubusercontent.com/gokul2507/Claude-Web-Bridge/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/gokul2507/Claude-Web-Bridge/main/install.sh)
 ```
 
 ## Multiple Chrome windows and profiles

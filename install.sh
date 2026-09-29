@@ -1,17 +1,12 @@
 #!/bin/bash
 # Claude Web Bridge - Remote Install Script
-# Usage: TOKEN=ghp_xxxx bash <(curl -sH "Authorization: token ghp_xxxx" https://raw.githubusercontent.com/gokul2507/Claude-Web-Bridge/main/install.sh)
+# Usage: bash <(curl -fsSL https://raw.githubusercontent.com/gokul2507/Claude-Web-Bridge/main/install.sh)
+# For a private fork, set TOKEN to a GitHub token with read access and REPO to the fork.
 set -e
 
 INSTALL_DIR="$HOME/.claude-web-bridge"
-REPO="gokul2507/Claude-Web-Bridge"
+REPO="${REPO:-gokul2507/Claude-Web-Bridge}"
 BRANCH="main"
-
-if [ -z "$TOKEN" ]; then
-  echo "Error: TOKEN is required."
-  echo "Usage: TOKEN=ghp_xxxx bash <(curl -sH \"Authorization: token ghp_xxxx\" https://raw.githubusercontent.com/$REPO/$BRANCH/install.sh)"
-  exit 1
-fi
 
 echo "━━━ Claude Web Bridge Installer ━━━"
 echo ""
@@ -22,10 +17,14 @@ if [ -d "$INSTALL_DIR" ]; then
   rm -rf "$INSTALL_DIR"
 fi
 
-# Download repo as tarball using token
+# Download repo as tarball (TOKEN is only needed for a private fork)
 echo "→ Downloading Claude Web Bridge..."
 mkdir -p "$INSTALL_DIR"
-curl -sL -H "Authorization: token $TOKEN" \
+AUTH=()
+if [ -n "$TOKEN" ]; then
+  AUTH=(-H "Authorization: token $TOKEN")
+fi
+curl -fsSL "${AUTH[@]}" \
   "https://api.github.com/repos/$REPO/tarball/$BRANCH" | \
   tar xz --strip-components=1 -C "$INSTALL_DIR"
 
